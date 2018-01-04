@@ -34,4 +34,4 @@ const testRendering = new RenderTest({
   testPassThreshold: 0.99
 });
 
-testRedering.run();
+testRendering.run();

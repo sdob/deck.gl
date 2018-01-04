@@ -19,13 +19,14 @@
 // THE SOFTWARE.
 
 import {document} from 'global';
+import assert from 'assert';
 
 import {WebMercatorViewport, experimental} from 'deck.gl';
 const {DeckGLJS} = experimental;
 
-import diffImages from './luma.gl/gpgpu/diff-images';
+import diffImages from '../luma.gl/gpgpu/diff-images';
 
-export default class RenderingTest {
+export default class RenderTest {
   constructor({
     testCases,
     width = 800,
@@ -70,16 +71,16 @@ export default class RenderingTest {
     this.resultImage.style.mixBlendMode = 'difference';
 
     // Test result container
-    const resultContainer = document.createElement('div');
-    resultContainer.style.position = 'absolute';
-    resultContainer.style.zIndex = 1;
+    this.resultContainer = document.createElement('div');
+    this.resultContainer.style.position = 'absolute';
+    this.resultContainer.style.zIndex = 1;
 
     // Show the image element so the developer could save the image as
     // the golden image
     document.body.appendChild(deckGLContainer);
     document.body.appendChild(this.referenceImage);
     document.body.appendChild(this.resultImage);
-    document.body.appendChild(resultContainer);
+    document.body.appendChild(this.resultContainer);
   }
 
   _diffResult(name) {
@@ -96,14 +97,18 @@ export default class RenderingTest {
       }
     }
 
-    // Print diff result
-    this.reportResult(name, 1 - badPixels / pixelCount);
-
     // Render the next test case
     this.setState({
       currentTestIndex: this.state.currentTestIndex + 1,
       renderingCount: 0
     });
+
+    return {
+      name,
+      percentage: 1 - badPixels / pixelCount,
+      resultContainer: this.resultContainer,
+      testPassThreshold: this.testPassThreshold
+    };
   }
 
   _onDrawComplete(name, referenceResult, completed, {gl}) {
@@ -111,39 +116,43 @@ export default class RenderingTest {
       this.setState({
         renderingCount: this.state.renderingCount + 1
       });
-      return;
+      return null;
     }
 
     if (this.state.runningTests[name]) {
-      return;
+      return null;
     }
     // Mark current test as running
     this.state.runningTests[name] = true;
 
-    this.referenceImage.onload = () => {
-      this.resultImage.onload = () => {
-        // Both images are loaded, compare results
-        this._diffResult(name);
+    const promise = new Promise((resolve) => {
+      this.referenceImage.onload = () => {
+        this.resultImage.onload = () => {
+          return this._diffResult(name); // Both images are loaded, compare results
+        };
+        this.resultImage.src = gl.canvas.toDataURL();
       };
-      this.resultImage.src = gl.canvas.toDataURL();
-    };
-    this.referenceImage.src = referenceResult;
+      this.referenceImage.src = referenceResult;
+    });
+
+    // Print diff result
+    promise.then(result => this.reportResult(result));
   }
 
-  run() {
-    const {currentTestIndex, renderingCount} = this.state;
-    const {width, height, testCases} = this.props;
+  runTestCase(testCase) {
+    const {mapViewState, layersList, name, referenceResult, renderingTimes} = testCase;
 
-    if (!testCases[currentTestIndex]) {
-      return;
-    }
-
-    const {mapViewState, layersList, name, referenceResult, renderingTimes} = testCases[
-      currentTestIndex
-    ];
+    const {renderingCount} = this.state;
+    const {width, height} = this;
 
     const layers = [];
+
+    const maxRenderingCount = renderingTimes ? renderingTimes : 0;
+    const completed = renderingCount >= maxRenderingCount;
+
+    // Each test case can specify its own viewport
     const viewportProps = Object.assign({}, mapViewState, {width, height});
+    const viewport = new WebMercatorViewport(viewportProps);
 
     // const needLoadResource = false;
     // constructing layers
@@ -152,21 +161,30 @@ export default class RenderingTest {
       if (type !== undefined) {
         layers.push(new type(props)); // eslint-disable-line
       }
+
+      console.log('Updating layers');
+      this.deckgl.setProps({
+        layers,
+        viewport,
+        onAfterRender: this._onDrawComplete.bind(this, name, referenceResult, completed),
+      });
     }
+  }
 
-    const maxRenderingCount = renderingTimes ? renderingTimes : 0;
-    const completed = renderingCount >= maxRenderingCount;
-
+  run() {
     this.deckgl = new DeckGLJS({
       id: 'default-deckgl-overlay',
-      layers,
+      layers: [],
       width: this.width,
       height: this.height,
-      debug: true,
-      onAfterRender: this._onDrawComplete.bind(this, name, referenceResult, completed),
-      viewport: new WebMercatorViewport(viewportProps)
+      debug: true
     });
+
+    for (const tc of this.testCases) {
+      this.runTestCase(tc);
+    }
   }
+
 }
 
 function createImage(width, height) {
