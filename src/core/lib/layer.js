@@ -71,6 +71,21 @@ const defaultProps = {
 
 let counter = 0;
 
+class LayerState {
+  constructor({attributeManager}) {
+    assert(attributeManager);
+    this.attributeManager = attributeManager;
+    this.model = null;
+    this.needsRedraw = true;
+    this.subLayers = null; // reference to sublayers rendered in a previous cycle
+    this.stats = new Stats({id: 'draw'});
+    // animatedProps: null, // Computing animated props requires layer manager state
+    // TODO - move these fields here (risks breaking layers)
+    // attributeManager,
+    // needsRedraw: true,
+  }
+}
+
 export default class Layer {
   constructor(props) {
     // Call a helper function to merge the incoming props with defaults and freeze them.
@@ -81,15 +96,18 @@ export default class Layer {
     this.oldProps = EMPTY_PROPS; // Props from last render used for change detection
     this.count = counter++; // Keep track of how many layer instances you are generating
     this.lifecycle = LIFECYCLE.NO_STATE; // Helps track and debug the life cycle of the layers
-    this.state = null; // Will be set to the shared layer state object during layer matching
-    this.context = null; // Will reference layer manager's context, contains state shared by layers
     this.parentLayer = null; // reference to the composite layer parent that rendered this layer
-
-    // CompositeLayer members, need to be defined here because of the `Object.seal`
+    this.context = null; // Will reference layer manager's context, contains state shared by layers
+    this.state = null; // Will be set to the shared layer state object during layer matching
     this.internalState = null;
 
     // Seal the layer
     Object.seal(this);
+  }
+
+  // clone this layer with modified props - For testing
+  clone(newProps) {
+    return new this.constructor(Object.assign({}, this.props, newProps));
   }
 
   toString() {
@@ -101,10 +119,17 @@ export default class Layer {
     return this.internalState.stats;
   }
 
-  needsUpdate() {
-    // Call subclass lifecycle method
-    return this.shouldUpdateState(this._getUpdateParams());
-    // End lifecycle method
+  // Updates selected state members and marks the object for redraw
+  setState(state) {
+    Object.assign(this.state, state);
+    this.setNeedsRedraw();
+  }
+
+  // Sets the redraw flag for this layer, will trigger a redraw next animation frame
+  setNeedsRedraw(redraw = true) {
+    if (this.state) {
+      this.internalState.needsRedraw = redraw;
+    }
   }
 
   // Checks state of attributes and model
@@ -112,67 +137,17 @@ export default class Layer {
     return this._getNeedsRedraw(clearRedrawFlags);
   }
 
-  // //////////////////////////////////////////////////
-  // LIFECYCLE METHODS, overridden by the layer subclasses
-
-  // Called once to set up the initial state
-  // App can create WebGL resources
-  initializeState() {
-    throw new Error(`Layer ${this} has not defined initializeState`);
+  // Return an array of models used by this layer, can be overriden by layer subclass
+  getModels() {
+    return this.state.models || (this.state.model ? [this.state.model] : []);
   }
 
-  // Let's layer control if updateState should be called
-  shouldUpdateState({oldProps, props, oldContext, context, changeFlags}) {
-    return changeFlags.propsOrDataChanged;
+  // Checks if layer needs updating
+  needsUpdate() {
+    // Call subclass lifecycle method
+    return this.shouldUpdateState(this._getUpdateParams());
+    // End lifecycle method
   }
-
-  // Default implementation, all attributes will be invalidated and updated
-  // when data changes
-  updateState({oldProps, props, oldContext, context, changeFlags}) {
-    const {attributeManager} = this.state;
-    if (changeFlags.dataChanged && attributeManager) {
-      attributeManager.invalidateAll();
-    }
-  }
-
-  // Called once when layer is no longer matched and state will be discarded
-  // App can destroy WebGL resources here
-  finalizeState() {}
-
-  // Update attribute transition
-  updateTransition() {
-    const {model, attributeManager} = this.state;
-    const isInTransition = attributeManager && attributeManager.updateTransition();
-
-    if (model && isInTransition) {
-      model.setAttributes(attributeManager.getChangedAttributes({transition: true}));
-    }
-  }
-
-  // If state has a model, draw it with supplied uniforms
-  draw(opts) {
-    for (const model of this.getModels()) {
-      model.draw(opts);
-    }
-  }
-
-  // called to populate the info object that is passed to the event handler
-  // @return null to cancel event
-  getPickingInfo({info, mode}) {
-    const {index} = info;
-
-    if (index >= 0) {
-      // If props.data is an indexable array, get the object
-      if (Array.isArray(this.props.data)) {
-        info.object = this.props.data[index];
-      }
-    }
-
-    return info;
-  }
-
-  // END LIFECYCLE METHODS
-  // //////////////////////////////////////////////////
 
   // Returns true if the layer is pickable and visible.
   isPickable() {
@@ -195,86 +170,30 @@ export default class Layer {
     }
   }
 
-  // Calls attribute manager to update any WebGL attributes, can be redefined
-  updateAttributes(props) {
-    const {attributeManager} = this.state;
-    if (!attributeManager) {
-      return;
-    }
-
-    // Figure out data length
-    const numInstances = this.getNumInstances(props);
-
-    attributeManager.update({
-      data: props.data,
-      numInstances,
-      props,
-      transitions: props.transitions,
-      buffers: props,
-      context: this,
-      // Don't worry about non-attribute props
-      ignoreUnknownAttributes: true
-    });
-
-    // TODO - Use getModels?
-    const {model} = this.state;
-    if (model) {
-      const changedAttributes = attributeManager.getChangedAttributes({clearChangedFlags: true});
-      model.setAttributes(changedAttributes);
-    }
-  }
-
-  // Public API
-
-  // Updates selected state members and marks the object for redraw
-  setState(updateObject) {
-    Object.assign(this.state, updateObject);
-    this.state.needsRedraw = true;
-  }
-
-  // Sets the redraw flag for this layer, will trigger a redraw next animation frame
-  setNeedsRedraw(redraw = true) {
-    if (this.state) {
-      this.state.needsRedraw = redraw;
-    }
-  }
-
-  // Return an array of models used by this layer, can be overriden by layer subclass
-  getModels() {
-    return this.state.models || (this.state.model ? [this.state.model] : []);
-  }
-
   // PROJECTION METHODS
 
-  /**
-   * Projects a point with current map state (lat, lon, zoom, pitch, bearing)
-   *
-   * Note: Position conversion is done in shader, so in many cases there is no need
-   * for this function
-   * @param {Array|TypedArray} lngLat - long and lat values
-   * @return {Array|TypedArray} - x, y coordinates
-   */
+  // Projects a point with current map state (lat, lon, zoom, pitch, bearing)
   project(lngLat) {
     const {viewport} = this.context;
-    assert(Array.isArray(lngLat), 'Layer.project needs [lng,lat]');
+    assert(Array.isArray(lngLat));
     return viewport.project(lngLat);
   }
 
   unproject(xy) {
     const {viewport} = this.context;
-    assert(Array.isArray(xy), 'Layer.unproject needs [x,y]');
+    assert(Array.isArray(xy));
     return viewport.unproject(xy);
   }
 
   projectFlat(lngLat) {
     const {viewport} = this.context;
-    assert(Array.isArray(lngLat), 'Layer.project needs [lng,lat]');
+    assert(Array.isArray(lngLat));
     return viewport.projectFlat(lngLat);
   }
 
   unprojectFlat(xy) {
     const {viewport} = this.context;
-    assert(Array.isArray(xy), 'Layer.unproject needs [x,y]');
+    assert(Array.isArray(xy));
     return viewport.unprojectFlat(xy);
   }
 
@@ -319,6 +238,99 @@ export default class Layer {
     return index;
   }
 
+  // //////////////////////////////////////////////////
+  // LIFECYCLE METHODS, overridden by the layer subclasses
+
+  // Called once to set up the initial state
+  // App can create WebGL resources
+  initializeState() {
+    throw new Error(`Layer ${this} has not defined initializeState`);
+  }
+
+  // Let's layer control if updateState should be called
+  shouldUpdateState({oldProps, props, oldContext, context, changeFlags}) {
+    return changeFlags.propsOrDataChanged;
+  }
+
+  // Default implementation, all attributes will be invalidated and updated
+  // when data changes
+  updateState({oldProps, props, oldContext, context, changeFlags}) {
+    const {attributeManager} = this.state;
+    if (changeFlags.dataChanged && attributeManager) {
+      attributeManager.invalidateAll();
+    }
+  }
+
+  // Called once when layer is no longer matched and state will be discarded
+  // App can destroy WebGL resources here
+  finalizeState() {}
+
+  // If state has a model, draw it with supplied uniforms
+  draw(opts) {
+    for (const model of this.getModels()) {
+      model.draw(opts);
+    }
+  }
+
+  // called to populate the info object that is passed to the event handler
+  // @return null to cancel event
+  getPickingInfo({info, mode}) {
+    const {index} = info;
+
+    if (index >= 0) {
+      // If props.data is an indexable array, get the object
+      if (Array.isArray(this.props.data)) {
+        info.object = this.props.data[index];
+      }
+    }
+
+    return info;
+  }
+
+  // END LIFECYCLE METHODS
+  // //////////////////////////////////////////////////
+
+  // INTERNAL METHODS
+
+  // Calls attribute manager to update any WebGL attributes
+  updateAttributes(props) {
+    const {attributeManager} = this.state;
+    if (!attributeManager) {
+      return;
+    }
+
+    // Figure out data length
+    const numInstances = this.getNumInstances(props);
+
+    attributeManager.update({
+      data: props.data,
+      numInstances,
+      props,
+      transitions: props.transitions,
+      buffers: props,
+      context: this,
+      // Don't worry about non-attribute props
+      ignoreUnknownAttributes: true
+    });
+
+    // TODO - Use getModels?
+    const {model} = this.state;
+    if (model) {
+      const changedAttributes = attributeManager.getChangedAttributes({clearChangedFlags: true});
+      model.setAttributes(changedAttributes);
+    }
+  }
+
+  // Update attribute transition
+  updateTransition() {
+    const {model, attributeManager} = this.state;
+    const isInTransition = attributeManager && attributeManager.updateTransition();
+
+    if (model && isInTransition) {
+      model.setAttributes(attributeManager.getChangedAttributes({transition: true}));
+    }
+  }
+
   calculateInstancePickingColors(attribute, {numInstances}) {
     const {value, size} = attribute;
     // add 1 to index to seperate from no selection
@@ -329,20 +341,6 @@ export default class Layer {
       value[i * size + 2] = pickingColor[2];
     }
   }
-
-  // DATA ACCESS API
-  // Data can use iterators and may not be random access
-
-  // Use iteration (the only required capability on data) to get first element
-  getFirstObject() {
-    const {data} = this.props;
-    for (const object of data) {
-      return object;
-    }
-    return null;
-  }
-
-  // INTERNAL METHODS
 
   // Deduces numer of instances. Intention is to support:
   // - Explicit setting of numInstances
@@ -365,11 +363,6 @@ export default class Layer {
     // Use container library to get a count for any ES6 container or object
     const {data} = props;
     return count(data);
-  }
-
-  // clone this layer with modified props
-  clone(newProps) {
-    return new this.constructor(Object.assign({}, this.props, newProps));
   }
 
   // LAYER MANAGER API
@@ -397,20 +390,11 @@ export default class Layer {
       }
     });
 
-    this.internalState = {
-      subLayers: null, // reference to sublayers rendered in a previous cycle
-      stats: new Stats({id: 'draw'})
-      // animatedProps: null, // Computing animated props requires layer manager state
-      // TODO - move these fields here (risks breaking layers)
-      // attributeManager,
-      // needsRedraw: true,
-    };
+    this.internalState = new LayerState({
+      attributeManager
+    });
 
-    this.state = {
-      attributeManager,
-      model: null,
-      needsRedraw: true
-    };
+    this.state = this.internalState;
 
     // Call subclass lifecycle methods
     this.initializeState(this.context);
@@ -639,13 +623,13 @@ ${flags.viewportChanged ? 'viewport' : ''}\
   _getNeedsRedraw(clearRedrawFlags) {
     // this method may be called by the render loop as soon a the layer
     // has been created, so guard against uninitialized state
-    if (!this.state) {
+    if (!this.internalState) {
       return false;
     }
 
     let redraw = false;
-    redraw = redraw || (this.state.needsRedraw && this.id);
-    this.state.needsRedraw = this.state.needsRedraw && !clearRedrawFlags;
+    redraw = redraw || (this.internalState.needsRedraw && this.id);
+    this.internalState.needsRedraw = this.internalState.needsRedraw && !clearRedrawFlags;
 
     // TODO - is attribute manager needed? - Model should be enough.
     const {attributeManager} = this.state;
@@ -730,7 +714,7 @@ ${flags.viewportChanged ? 'viewport' : ''}\
     }
 
     // TODO - set needsRedraw on the model(s)?
-    this.state.needsRedraw = true;
+    this.setNeedsRedraw();
   }
 
   _updateModuleSettings() {
@@ -751,7 +735,7 @@ ${flags.viewportChanged ? 'viewport' : ''}\
     }
 
     // TODO - set needsRedraw on the model(s)?
-    this.state.needsRedraw = true;
+    this.setNeedsRedraw();
     log.deprecated('layer.setUniforms', 'model.setUniforms');
   }
 }
